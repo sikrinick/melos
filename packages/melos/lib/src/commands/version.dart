@@ -131,6 +131,24 @@ mixin _VersionMixin on _RunMixin {
       packageCommits,
     );
 
+    // Determine which ignored packages have versionable commits or were
+    // specified in --manual-version, so we can prevent versioning packages
+    // that depend on them.
+    final ignoredPackagesWithChanges = await _getIgnoredPackagesWithChanges(
+      workspace,
+      versionPrivatePackages: versionPrivatePackages,
+      diff: packageFilters?.diff,
+    );
+    // Also count ignored packages that were explicitly requested for manual
+    // versioning — this signals the user believes the package has changes
+    // worth releasing, so dependents should not be versioned without it.
+    for (final packageName in manualVersions.keys) {
+      if (workspace.filteredPackages[packageName] == null &&
+          workspace.allPackages[packageName] != null) {
+        ignoredPackagesWithChanges.add(packageName);
+      }
+    }
+
     for (final packageName in manualVersions.keys) {
       if (!workspace.allPackages.keys.contains(packageName)) {
         exitCode = 1;
@@ -139,10 +157,17 @@ mixin _VersionMixin on _RunMixin {
         );
         return;
       }
+      if (workspace.filteredPackages[packageName] == null) {
+        logger.warning(
+          'package "$packageName" was specified in --manual-version but is '
+          'excluded by package filters (e.g. --ignore). Skipping.',
+        );
+      }
     }
 
     final packagesToManuallyVersion = manualVersions.keys
-        .map((packageName) => workspace.allPackages[packageName]!)
+        .map((name) => workspace.filteredPackages[name])
+        .whereType<Package>()
         .toSet();
     final packagesToAutoVersion = {
       for (final package in workspace.filteredPackages.values)
@@ -150,6 +175,39 @@ mixin _VersionMixin on _RunMixin {
           if (packagesWithVersionableCommits.contains(package.name))
             if (!asStableRelease || !package.version.isPreRelease) package,
     };
+
+    // Remove packages that depend (directly or transitively) on an ignored
+    // package with pending changes, since versioning them without also
+    // versioning the ignored dependency could produce a broken release.
+    if (ignoredPackagesWithChanges.isNotEmpty) {
+      bool dependsOnIgnoredWithChanges(Package package) {
+        final unscoped = workspace.allPackages[package.name]!;
+        return unscoped.allTransitiveDependenciesInWorkspace.keys.any(
+          ignoredPackagesWithChanges.contains,
+        );
+      }
+
+      for (final package in [...packagesToManuallyVersion]) {
+        if (dependsOnIgnoredWithChanges(package)) {
+          packagesToManuallyVersion.remove(package);
+          logger.warning(
+            'Package "${package.name}" depends on an ignored package '
+            'that has pending changes. Skipping to avoid a broken '
+            'release.',
+          );
+        }
+      }
+      for (final package in [...packagesToAutoVersion]) {
+        if (dependsOnIgnoredWithChanges(package)) {
+          packagesToAutoVersion.remove(package);
+          logger.warning(
+            'Package "${package.name}" depends on an ignored package '
+            'that has pending changes. Skipping to avoid a broken '
+            'release.',
+          );
+        }
+      }
+    }
     final packagesToVersion = {
       ...packagesToManuallyVersion,
       ...packagesToAutoVersion,
@@ -178,7 +236,9 @@ mixin _VersionMixin on _RunMixin {
 
         final packageUnscoped = workspace.allPackages[package.name]!;
         dependentPackagesToVersion.addAll(
-          packageUnscoped.dependentsInWorkspace.values,
+          packageUnscoped.dependentsInWorkspace.values.where(
+            (p) => workspace.filteredPackages[p.name] != null,
+          ),
         );
       }
     }
@@ -186,22 +246,30 @@ mixin _VersionMixin on _RunMixin {
     for (final package in packagesToVersion) {
       final packageUnscoped = workspace.allPackages[package.name]!;
       dependentPackagesToVersion.addAll(
-        packageUnscoped.dependentsInWorkspace.values,
+        packageUnscoped.dependentsInWorkspace.values.where(
+          (p) => workspace.filteredPackages[p.name] != null,
+        ),
       );
+    }
 
-      // Add dependentsInWorkspace dependents in the workspace until no more are
-      // added.
-      var packagesAdded = 1;
-      while (packagesAdded != 0) {
-        final packagesCountBefore = dependentPackagesToVersion.length;
-        final packages = <Package>{...dependentPackagesToVersion};
-        for (final dependentPackage in packages) {
-          dependentPackagesToVersion.addAll(
-            dependentPackage.dependentsInWorkspace.values,
-          );
-        }
-        packagesAdded = dependentPackagesToVersion.length - packagesCountBefore;
+    // Transitively collect dependents in the workspace until no more are
+    // added. Ignored packages are excluded and not traversed through, so
+    // packages that would only need a version bump via an ignored
+    // intermediate are also excluded.
+    // This runs once after both the graduate and commit loops so that
+    // dependents of graduated packages are also traversed.
+    var packagesAdded = 1;
+    while (packagesAdded != 0) {
+      final packagesCountBefore = dependentPackagesToVersion.length;
+      final packages = <Package>{...dependentPackagesToVersion};
+      for (final dependentPackage in packages) {
+        dependentPackagesToVersion.addAll(
+          dependentPackage.dependentsInWorkspace.values.where(
+            (p) => workspace.filteredPackages[p.name] != null,
+          ),
+        );
       }
+      packagesAdded = dependentPackagesToVersion.length - packagesCountBefore;
     }
 
     pendingPackageUpdates.addAll(
@@ -772,6 +840,37 @@ mixin _VersionMixin on _RunMixin {
     }
 
     return packagesWithVersionableCommits;
+  }
+
+  /// Returns the names of packages that are ignored (in `allPackages` but not
+  /// in `filteredPackages`) and that have versionable commits.
+  Future<Set<String>> _getIgnoredPackagesWithChanges(
+    MelosWorkspace workspace, {
+    required bool versionPrivatePackages,
+    required String? diff,
+  }) async {
+    final ignoredPackages = workspace.allPackages.values.where(
+      (p) => workspace.filteredPackages[p.name] == null,
+    );
+    final result = <String>{};
+    await Pool(10).forEach<Package, void>(ignoredPackages, (package) async {
+      if (!versionPrivatePackages && package.isPrivate) {
+        return;
+      }
+      final commits = await gitCommitsForPackage(
+        package,
+        diff: diff,
+        logger: logger,
+      );
+      final hasVersionableCommit = commits
+          .map(RichGitCommit.tryParse)
+          .whereType<RichGitCommit>()
+          .any((c) => c.parsedMessage.isVersionableCommit);
+      if (hasVersionableCommit) {
+        result.add(package.name);
+      }
+    }).drain<void>();
+    return result;
   }
 
   Future<Map<String, List<RichGitCommit>>> _getPackageCommits(
